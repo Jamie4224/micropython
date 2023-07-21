@@ -78,6 +78,9 @@ static bool mdns_initialised = false;
 static uint8_t conf_wifi_sta_reconnects = 0;
 static uint8_t wifi_sta_reconnects;
 
+static uint8_t conf_wifi_sta_reconnects_wrong_password = 3;
+static uint8_t wifi_sta_reconnects_wrong_password;
+
 // This function is called by the system-event task and so runs in a different
 // thread to the main MicroPython task.  It must not raise any Python exceptions.
 static void network_wlan_wifi_event_handler(void *event_handler_arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
@@ -86,6 +89,7 @@ static void network_wlan_wifi_event_handler(void *event_handler_arg, esp_event_b
             ESP_LOGI("wifi", "STA_START");
             wlan_sta_obj.active = true;
             wifi_sta_reconnects = 0;
+            wifi_sta_reconnects_wrong_password = 0;
             break;
 
         case WIFI_EVENT_STA_STOP:
@@ -94,6 +98,7 @@ static void network_wlan_wifi_event_handler(void *event_handler_arg, esp_event_b
 
         case WIFI_EVENT_STA_CONNECTED:
             ESP_LOGI("network", "CONNECTED");
+            wifi_sta_reconnects_wrong_password = 0;
             break;
 
         case WIFI_EVENT_STA_DISCONNECTED: {
@@ -102,6 +107,7 @@ static void network_wlan_wifi_event_handler(void *event_handler_arg, esp_event_b
 
             wifi_event_sta_disconnected_t *disconn = event_data;
             char *message = "";
+            int auth_failure = 0;
             wifi_sta_disconn_reason = disconn->reason;
             switch (disconn->reason) {
                 case WIFI_REASON_BEACON_TIMEOUT:
@@ -113,8 +119,11 @@ static void network_wlan_wifi_event_handler(void *event_handler_arg, esp_event_b
                     message = "\nno AP found";
                     break;
                 case WIFI_REASON_AUTH_FAIL:
+                case WIFI_REASON_AUTH_EXPIRE: // iPhone
+                case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT: // Unifi, TP Link, Ziggo modem
                     // Password may be wrong, or it just failed to connect; try to reconnect.
                     message = "\nauthentication failed";
+                    auth_failure = 1;
                     break;
                 default:
                     // Let other errors through and try to reconnect.
@@ -135,6 +144,13 @@ static void network_wlan_wifi_event_handler(void *event_handler_arg, esp_event_b
                     ESP_LOGI("wifi", "reconnect counter=%d, max=%d",
                         wifi_sta_reconnects, conf_wifi_sta_reconnects);
                     if (++wifi_sta_reconnects >= conf_wifi_sta_reconnects) {
+                        break;
+                    }
+                }
+                if (auth_failure) { // && conf_wifi_sta_reconnects_wrong_password
+                    ESP_LOGI("wifi", "reconnect wrong password counter=%d, max=%d",
+                             wifi_sta_reconnects_wrong_password, conf_wifi_sta_reconnects_wrong_password);
+                    if (++wifi_sta_reconnects_wrong_password >= conf_wifi_sta_reconnects_wrong_password) {
                         break;
                     }
                 }
@@ -308,6 +324,7 @@ STATIC mp_obj_t network_wlan_connect(size_t n_args, const mp_obj_t *pos_args, mp
     esp_exceptions(esp_netif_set_hostname(wlan_sta_obj.netif, mod_network_hostname));
 
     wifi_sta_reconnects = 0;
+    wifi_sta_reconnects_wrong_password = 0;
     // connect to the WiFi AP
     MP_THREAD_GIL_EXIT();
     esp_exceptions(esp_wifi_connect());
@@ -333,6 +350,9 @@ STATIC mp_obj_t network_wlan_status(size_t n_args, const mp_obj_t *args) {
             if (wifi_sta_connected) {
                 // Happy path, connected with IP
                 return MP_OBJ_NEW_SMALL_INT(STAT_GOT_IP);
+            } else if (wifi_sta_connect_requested && wifi_sta_reconnects_wrong_password >= conf_wifi_sta_reconnects_wrong_password && conf_wifi_sta_reconnects_wrong_password != 0) {
+                // Trying to connect but got wrong password many times in a row
+                return MP_OBJ_NEW_SMALL_INT(STAT_WRONG_PASSWORD);
             } else if (wifi_sta_connect_requested
                        && (conf_wifi_sta_reconnects == 0
                            || wifi_sta_reconnects < conf_wifi_sta_reconnects)) {
@@ -543,6 +563,14 @@ STATIC mp_obj_t network_wlan_config(size_t n_args, const mp_obj_t *args, mp_map_
                         conf_wifi_sta_reconnects = (reconnects == -1) ? 0 : reconnects + 1;
                         break;
                     }
+                    case MP_QSTR_wrong_password_reconnects: {
+                        int wp_reconnects = mp_obj_get_int(kwargs->table[i].value);
+                        req_if = ESP_IF_WIFI_STA;
+                        // parameter reconnects == -1 means to retry forever.
+                        // here means conf_wifi_sta_reconnects_wrong_password == 0 to retry forever.
+                        conf_wifi_sta_reconnects_wrong_password = (wp_reconnects == -1) ? 0 : wp_reconnects + 1;
+                        break;
+                    }
                     case MP_QSTR_txpower: {
                         int8_t power = (mp_obj_get_float(kwargs->table[i].value) * 4);
                         esp_exceptions(esp_wifi_set_max_tx_power(power));
@@ -637,6 +665,11 @@ STATIC mp_obj_t network_wlan_config(size_t n_args, const mp_obj_t *args, mp_map_
             req_if = ESP_IF_WIFI_STA;
             int rec = conf_wifi_sta_reconnects - 1;
             val = MP_OBJ_NEW_SMALL_INT(rec);
+            break;
+        case MP_QSTR_wrong_password_reconnects:
+            req_if = ESP_IF_WIFI_STA;
+            int wp_rec = conf_wifi_sta_reconnects_wrong_password - 1;
+            val = MP_OBJ_NEW_SMALL_INT(wp_rec);
             break;
         case MP_QSTR_txpower: {
             int8_t power;

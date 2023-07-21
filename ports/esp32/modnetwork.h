@@ -38,6 +38,7 @@ enum {
     STAT_IDLE       = 1000,
     STAT_CONNECTING = 1001,
     STAT_GOT_IP     = 1010,
+    STAT_WRONG_PASSWORD = 1020,
 };
 
 typedef struct _base_if_obj_t {
